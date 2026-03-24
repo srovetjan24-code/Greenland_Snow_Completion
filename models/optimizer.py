@@ -1,69 +1,60 @@
 import numpy as np
-from modules.weighting import compute_adaptive_weights
-from utils.math_ops import tensor_unfold, tensor_fold
+from modules.weighting import swish_derivative
 
 
-class ADMM_Solver:
-    def __init__(self, rho=0.01, max_iter=50, epsilon=1e-4):
-        self.mu = rho  # 惩罚参数 [cite: 704, 860]
-        self.max_iter = max_iter  # 最大迭代次数 [cite: 860]
-        self.epsilon = epsilon  # 收敛阈值
-
-    # models/optimizer.py 修改第 14 行：
-    def _singular_value_thresholding(self, matrix, threshold):
-        # 强制转为 float32 节省一半内存
-        matrix = matrix.astype(np.float32)
-        U, S, Vh = np.linalg.svd(matrix, full_matrices=False)
-        S_threshold = np.maximum(S - threshold, 0)
-        # 注意：使用 np.diag(S_threshold) 恢复
-        return (U * S_threshold) @ Vh, S
-
-    def solve(self, X_res, mask, transforms):
+class BNLFT_Optimizer:
+    def __init__(self, lr=0.01, lam_swish=0.05, gamma_smooth=0.01, lam_bias=0.01):
         """
-        使用 ADMM 算法迭代求解 STPTC 模型 [cite: 301, 612]
+        :param lr: 学习率 [cite: 175]
+        :param lam_swish: Swish 正则化系数 [cite: 145, 165]
+        :param gamma_smooth: 时空平滑/周期约束系数 [cite: 152, 167]
+        :param lam_bias: 偏置项正则化系数 [cite: 160]
         """
-        # 初始化 [cite: 700, 704]
-        H = np.zeros_like(X_res)
-        K = np.zeros_like(X_res)
-        H_modes = [np.zeros_like(X_res) for _ in range(3)]
-        M_modes = [np.zeros_like(X_res) for _ in range(3)]
-        N = np.zeros_like(X_res)
-        alpha = [1 / 3, 1 / 3, 1 / 3]  # 初始权重 [cite: 860]
+        self.lr = lr
+        self.lam = lam_swish
+        self.gamma = gamma_smooth
+        self.lam_b = lam_bias
 
-        for t in range(self.max_iter):
-            H_prev = H.copy()
-            singular_values_list = []
+    def step(self, model, i, j, k, true_val, n_d=None):
+        """
+        执行一步带周期约束的 SGD 更新
+        n_d: 周期步数 (如 286)
+        """
+        # 1. 计算预测残差 [cite: 128, 138]
+        pred = model.predict(i, j, k)
+        error = true_val - pred
 
-            # --- 步骤 1: 更新各模式下的 H_k [cite: 706] ---
-            for k in range(3):
-                # 融合变换矩阵增强的结构 [cite: 572]
-                # 注意：实际论文中此处涉及变换矩阵 Tk 的逆运算或投影
-                target = tensor_unfold(H + M_modes[k] / self.mu, k)
-                updated_matrix, s = self._singular_value_thresholding(
-                    target, alpha[k] / self.mu
-                )
-                H_modes[k] = tensor_fold(updated_matrix, k, X_res.shape)
-                singular_values_list.append(s)
+        # 2. 更新空间因子 S (经度) 和 D (纬度) [cite: 217, 218]
+        for r in range(model.R):
+            # 空间平滑项 (引入 STPTC 的相邻约束思想) [cite: 151]
+            smooth_S = self.gamma * (model.S[i, r] - model.S[i - 1, r]) if i > 0 else 0
 
-            # --- 步骤 2: 动态更新自适应权重 alpha [cite: 606, 715] ---
-            alpha = compute_adaptive_weights(singular_values_list)
+            grad_S = -2 * error * (model.D[j, r] * model.T[k, r]) + \
+                     self.lam * swish_derivative(model.S[i, r]) + smooth_S
+            model.S[i, r] -= self.lr * grad_S
+            model.S[i, r] = max(0, model.S[i, r])  # 非负性保证 [cite: 195, 339]
 
-            # --- 步骤 3: 更新恢复张量 H [cite: 706, 719] ---
-            # 综合各维度信息并保持与观测值的一致性
-            H = (sum(H_modes) - sum(M_modes) / self.mu + (X_res - K + N / self.mu)) / 4.0
+            grad_D = -2 * error * (model.S[i, r] * model.T[k, r]) + \
+                     self.lam * swish_derivative(model.D[j, r])
+            model.D[j, r] -= self.lr * grad_D
+            model.D[j, r] = max(0, model.D[j, r])
 
-            # --- 步骤 4: 更新辅助变量 K (处理缺失值) [cite: 669, 706] ---
-            # 只有非观测位置 (mask == 0) 的值会被更新
-            K = (X_res - H + N / self.mu)
-            K[mask == 1] = 0
+        # 3. 更新时间因子 T (引入 STPTC 周期循环约束) [cite: 219, 338]
+        for r in range(model.R):
+            smooth_T = 0
+            # 相邻天平滑 [cite: 151]
+            if k > 0:
+                smooth_T += self.gamma * (model.T[k, r] - model.T[k - 1, r])
+            # STPTC 周期约束：惩罚与去年同期的差异 [cite: 167]
+            if n_d and k >= n_d:
+                smooth_T += self.gamma * (model.T[k, r] - model.T[k - n_d, r])
 
-            # --- 步骤 5: 更新乘子 M_k 和 N [cite: 708] ---
-            for k in range(3):
-                M_modes[k] += self.mu * (H - H_modes[k])
-            N += self.mu * (X_res - H - K)
+            grad_T = -2 * error * (model.S[i, r] * model.D[j, r]) + \
+                     self.lam * swish_derivative(model.T[k, r]) + smooth_T
+            model.T[k, r] -= self.lr * grad_T
+            model.T[k, r] = max(0, model.T[k, r])
 
-            # 检查收敛 [cite: 860]
-            if np.linalg.norm(H - H_prev) / (np.linalg.norm(H_prev) + 1e-6) < self.epsilon:
-                break
-
-        return H
+        # 4. 更新偏置项 [cite: 213, 220]
+        model.a[i] += self.lr * (2 * error - self.lam_b * model.a[i])
+        model.b[j] += self.lr * (2 * error - self.lam_b * model.b[j])
+        model.c[k] += self.lr * (2 * error - self.lam_b * model.c[k])

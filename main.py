@@ -1,68 +1,57 @@
 import numpy as np
 import pandas as pd
-import os
-from models.stptc_model import STPTC
-
-
-def load_and_preprocess(file_path):
-    """加载 CSV 并生成掩码 [cite: 584, 700]"""
-    df = pd.read_csv(file_path, header=None)
-    # 使用 float32 降低内存占用 [cite: 1609]
-    raw_data = df.values.astype(np.float32)
-    raw_data = np.nan_to_num(raw_data, nan=0.0)
-    # 1 表示观测值，0 表示缺失 [cite: 585]
-    mask = (raw_data != 0).astype(np.float32)
-    return raw_data, mask
+from models.lft_model import BNLFT_Model
+from models.optimizer import BNLFT_Optimizer
 
 
 def main():
-    # --- 1. 数据加载与路径 ---
+    # --- 1. 参数与路径 ---
     file_path = r'E:\research\LFT_project\BNLFT\BNLFT\gamadata\A_interpolated_with_idw.csv'
-    if not os.path.exists(file_path):
-        print(f"错误：未找到文件 {file_path}")
-        return
+    n_y, n_d = 1, 286  # 周期设定 [cite: 99]
+    R = 10  # 分解秩 [cite: 109]
+    chunk_size = 1000  # STPTC 分块思想：每次处理1000个空间点
+    epochs = 5  # 迭代轮数 [cite: 171]
 
-    print(f"正在读取真实数据集...")
-    X_raw, mask_raw = load_and_preprocess(file_path)
+    # --- 2. 加载数据并转为长格式 ---
+    print("正在加载数据并构建索引...")
+    df = pd.read_csv(file_path, header=None)
+    raw_data = df.values.astype(np.float32)
+    m_n_total, t_total = raw_data.shape
 
-    # --- 2. 参数自动适配 [cite: 346] ---
-    m_n_total = X_raw.shape[0]  # 空间点数
-    t_actual = X_raw.shape[1]  # 实际时间步长 (286)
+    # --- 3. 分块循环执行 BNLFT-swish ---
+    final_result = np.zeros_like(raw_data)
 
-    # 核心修复：确保 n_y * n_d == t_actual [cite: 347, 540]
-    n_y = 1
-    n_d = t_actual
+    for start_node in range(0, m_n_total, chunk_size):
+        end_node = min(start_node + chunk_size, m_n_total)
+        current_chunk_size = end_node - start_node
+        print(f"正在处理分块: {start_node} 到 {end_node}...")
 
-    # 分块大小：防止 46GB 内存溢出 [cite: 1611, 1710]
-    chunk_size = 1000
-    X_filled_total = np.zeros_like(X_raw)
+        # 初始化当前块的模型 [cite: 106, 107, 108]
+        # 注意：此处 J (纬度) 简化处理为 1，因为 CSV 已平铺
+        model = BNLFT_Model(I=current_chunk_size, J=1, K=t_total, R=R)
+        optimizer = BNLFT_Optimizer(lr=0.01, gamma_smooth=0.05)
 
-    # --- 3. 分块处理循环 [cite: 1719] ---
-    print(f"检测到大规模数据：{m_n_total} 个点。启动分块模式...")
-    for i in range(0, m_n_total, chunk_size):
-        end = min(i + chunk_size, m_n_total)
-        print(f"进度: {end / m_n_total:.1%} | 正在处理 {i} 到 {end}...")
+        # 提取有效观测点 (i, j, k, val) [cite: 101, 115]
+        chunk_slice = raw_data[start_node:end_node, :]
+        obs_indices = np.argwhere(chunk_slice > 0)
 
-        X_chunk = X_raw[i:end, :]
-        mask_chunk = mask_raw[i:end, :]
+        # --- 4. 训练阶段 (SGD) [cite: 171, 216] ---
+        for epoch in range(epochs):
+            np.random.shuffle(obs_indices)  # 打乱样本增加鲁棒性 [cite: 209]
+            for idx in obs_indices:
+                i_idx, k_idx = idx[0], idx[1]
+                val = chunk_slice[i_idx, k_idx]
+                # 执行带周期约束的更新
+                optimizer.step(model, i_idx, 0, k_idx, val, n_d=n_d)
 
-        # 初始化 STPTC 模型 [cite: 299]
-        model = STPTC(n_y=n_y, n_d=n_d)
+        # --- 5. 补全该块的所有缺失值 [cite: 112, 128] ---
+        for i in range(current_chunk_size):
+            for k in range(t_total):
+                final_result[start_node + i, k] = model.predict(i, 0, k)
 
-        try:
-            # 补全计算 [cite: 301, 721]
-            X_res = model.fit_transform(X_chunk, mask_chunk)
-            X_filled_total[i:end, :] = X_res.reshape(end - i, t_actual)
-        except Exception as e:
-            print(f"分块 {i} 出错: {e}")
-            continue
-
-    print("\n--- STPTC 补全任务成功完成 ---")
-    # pd.DataFrame(X_filled_total).to_csv('Result.csv', index=False, header=False)
-    # 在 main.py 的 print 之后添加这行 [cite: 721]
-    result_df = pd.DataFrame(X_filled_total)
-    result_df.to_csv('Gap_Filled_Result.csv', index=False, header=False)
-    print("结果已保存至项目根目录下的 Gap_Filled_Result.csv")
+    # --- 6. 保存结果 ---
+    pd.DataFrame(final_result).to_csv('SeaIce_Filled_BNLFT.csv', index=False, header=False)
+    print("补全任务结束，结果已存至 SeaIce_Filled_BNLFT.csv")
 
 
 if __name__ == "__main__":
