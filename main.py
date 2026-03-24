@@ -38,7 +38,7 @@ def main():
         # 初始化当前块的局部模型
         # 注意：时间因子 T 和时间偏置 c 在全局应该是连续的，但为了内存安全，此处演示局部处理逻辑
         model = BNLFT_Model(I=actual_chunk_size, J=1, K=num_times, R=rank)
-        optimizer = BNLFT_Optimizer(lr=0.01, lam_swish=0.05, gamma_smooth=0.01)
+        optimizer = BNLFT_Optimizer(lr=0.01)
 
         # 训练当前块
         for it in range(iterations):

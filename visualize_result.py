@@ -46,4 +46,4 @@ def plot_sea_ice_thickness(file_path):
 
 
 if __name__ == "__main__":
-    plot_sea_ice_thickness('SeaIce_Filled_BNLFT.csv')
+    plot_sea_ice_thickness('SeaIce_Filled_BNLFT_Overlap.csv')
