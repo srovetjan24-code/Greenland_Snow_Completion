@@ -5,13 +5,12 @@ from modules.weighting import swish_derivative
 # models/lft_model.py
 
 class BNLFT_Model:
-    def __init__(self, I, J, K, R=10):
-        """
-        I, J, K 分别为经度、纬度、时间网格数 [cite: 97, 98, 99]
-        R 为分解的秩 [cite: 103, 109]
-        """
-        self.R = R  # --- 必须加上这一行，解决报错的核心 ---
-
+    def __init__(self, I, J, K, R):
+        self.I = I  # 确保这里定义了 self.I
+        self.J = J
+        self.K = K
+        self.R = R
+        # ... 其他初始化矩阵的代码 ...
         # 初始化潜在因子矩阵 [cite: 106, 107, 108]
         self.S = np.random.rand(I, R).astype(np.float32)
         self.D = np.random.rand(J, R).astype(np.float32)

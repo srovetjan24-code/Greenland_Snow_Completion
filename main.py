@@ -10,7 +10,7 @@ def main():
     chunk_size = 1000  # 每个块的大小
     overlap = 100  # 导师建议的重叠量
     step = chunk_size - overlap  # 实际滑动的步长
-    rank = 10  # 潜在因子数量 (R)
+    rank = 30  # 潜在因子数量 (R)
     iterations = 50  # 每个块的训练轮数
 
     # --- 2. 加载原始稀疏数据 ---
