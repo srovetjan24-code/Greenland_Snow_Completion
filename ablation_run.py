@@ -1,84 +1,93 @@
-import numpy as np
 import pandas as pd
+import numpy as np
+import os
 from models.lft_model import BNLFT_Model
 from models.optimizer import BNLFT_Optimizer
 
 
-def create_missing_data(data, rate):
+def run_experiment(exp_name, use_ar, use_graph, raw_data, params):
     """
-    手动制造缺失值进行压力测试
+    运行单组消融实验
     """
-    missing_data = data.copy()
-    # 找到原始数据中有值的点 (非NaN且大于0)
-    ix, iy = np.where((~np.isnan(data)) & (data > 0))
-    samples = len(ix)
+    num_nodes, num_times = raw_data.shape
+    chunk_size = params['chunk_size']
+    overlap = params['overlap']
+    step_size = chunk_size - overlap
 
-    # 随机选择索引进行掩盖
-    num_to_mask = int(samples * rate)
-    mask_idx = np.random.choice(samples, num_to_mask, replace=False)
+    final_result = np.zeros_like(raw_data, dtype=float)
+    count_matrix = np.zeros_like(raw_data, dtype=float)
 
-    # 记录真实值用于后续 RMSE 计算
-    masked_vals = data[ix[mask_idx], iy[mask_idx]]
-    # 制造缺失
-    missing_data[ix[mask_idx], iy[mask_idx]] = np.nan
+    # 线性渐变窗口
+    window = np.ones(chunk_size)
+    window[:overlap] = np.linspace(0, 1, overlap)
+    window[-overlap:] = np.linspace(1, 0, overlap)
 
-    return missing_data, masked_vals, (ix[mask_idx], iy[mask_idx])
+    print(f"\n>>> 开始实验: {exp_name} (AR={use_ar}, Graph={use_graph})")
+
+    for start_node in range(0, num_nodes, step_size):
+        end_node = min(start_node + chunk_size, num_nodes)
+        actual_chunk_size = end_node - start_node
+        chunk_data = raw_data[start_node:end_node, :]
+
+        model = BNLFT_Model(I=actual_chunk_size, J=1, K=num_times, R=params['rank'])
+        # 初始化优化器，传入消融实验开关
+        optimizer = BNLFT_Optimizer(lr=params['lr'], use_ar=use_ar, use_graph=use_graph)
+
+        for it in range(params['iterations']):
+            for i in range(actual_chunk_size):
+                for k in range(num_times):
+                    val = chunk_data[i, k]
+                    if not np.isnan(val):
+                        optimizer.step(model, i, 0, k, val, n_d=params['n_d'])
+
+        # 融合逻辑
+        current_window = window[:actual_chunk_size]
+        for i in range(actual_chunk_size):
+            w = current_window[i]
+            if start_node == 0 and i < overlap: w = 1.0
+            if end_node == num_nodes and i >= (actual_chunk_size - overlap): w = 1.0
+
+            for k in range(num_times):
+                final_result[start_node + i, k] += model.predict(i, 0, k) * w
+                count_matrix[start_node + i, k] += w
+
+    # 计算均值
+    final_result = np.divide(final_result, count_matrix, out=np.zeros_like(final_result), where=count_matrix > 1e-6)
+
+    # 保存结果
+    output_path = f"ablation_results/{exp_name}_result.csv"
+    os.makedirs("ablation_results", exist_ok=True)
+    pd.DataFrame(final_result).to_csv(output_path, index=False, header=False)
+    print(f"--- 实验 {exp_name} 完成，结果已保存至 {output_path} ---")
 
 
-def run_experiment(full_data, rate, config):
-    """
-    运行单个缺失率下的对比实验
-    """
-    # 1. 准备测试数据
-    masked_data, true_vals, (rows, cols) = create_missing_data(full_data, rate)
+def main():
+    # 1. 实验配置 [cite: 2026-03-24]
+    file_path = r'E:\TPDCGreenland\TPDCGreenland\Greenland_interp_slice_1.csv'
+    params = {
+        'chunk_size': 800,
+        'overlap': 200,
+        'rank': 40,
+        'iterations': 50,  # 消融实验建议先用较少轮数测试趋势
+        'lr': 0.001,
+        'n_d': 286
+    }
 
-    # 2. 初始化模型与优化器
-    # 确保传入 config 中的消融开关 (use_ar, use_graph 等)
-    model = BNLFT_Model(I=full_data.shape[0], J=1, K=full_data.shape[1], R=10)
-    optimizer = BNLFT_Optimizer(lr=0.01, **config)
+    # 2. 加载数据
+    raw_data = pd.read_csv(file_path, header=None).values
 
-    # 3. 迭代训练
-    iterations = 50
-    for it in range(iterations):
-        # 找到当前训练集中的非空点
-        train_ix, train_iy = np.where(~np.isnan(masked_data))
-        for r, c in zip(train_ix, train_iy):
-            # 修复核心：传入 n_d=286 并同步传入当前缺失率 rate
-            optimizer.step(model, r, 0, c, masked_data[r, c], n_d=286, missing_rate=rate)
+    # 3. 定义消融组合
+    experiments = [
+        {"name": "Full_Model", "use_ar": True, "use_graph": True},  # 全模型
+        {"name": "No_AR", "use_ar": False, "use_graph": True},  # 无时间自回归
+        {"name": "No_Graph", "use_ar": True, "use_graph": False},  # 无空间约束
+        {"name": "Base_Tensor", "use_ar": False, "use_graph": False}  # 基础张量分解
+    ]
 
-    # 4. 计算预测误差 (RMSE)
-    preds = []
-    for r, c in zip(rows, cols):
-        preds.append(model.predict(r, 0, c))
-
-    rmse = np.sqrt(np.mean((np.array(preds) - true_vals) ** 2))
-    return rmse
+    # 4. 循环运行
+    for exp in experiments:
+        run_experiment(exp['name'], exp['use_ar'], exp['use_graph'], raw_data, params)
 
 
 if __name__ == "__main__":
-    # 加载数据
-    data_path = r'E:\research\LFT_project\BNLFT\BNLFT\gamadata\A_interpolated_with_idw.csv'
-    raw_data = pd.read_csv(data_path, header=None).values
-
-    rates = [0.1, 0.3, 0.5, 0.7, 0.9]
-    results = []
-
-    print("--- 开始消融实验压力测试 ---")
-    for r in rates:
-        # 定义对比组
-        # Base_LFT: 原始模型 (关闭所有改进)
-        cfg_base = {'use_ar': False, 'use_graph': False}
-        # Ours: 全功能模型 (开启所有改进)
-        cfg_ours = {'use_ar': True, 'use_graph': True}
-
-        rmse_base = run_experiment(raw_data, r, cfg_base)
-        rmse_ours = run_experiment(raw_data, r, cfg_ours)
-
-        results.append([r, rmse_base, rmse_ours])
-        print(f"缺失率 {int(r * 100)}% | Base RMSE: {rmse_base:.4f} | Ours RMSE: {rmse_ours:.4f}")
-
-    # 打印最终对比表
-    print("\n### 最终消融实验结果对比 ###")
-    print("Rate\tBase_LFT\tOurs(Full)")
-    for res in results:
-        print(f"{res[0]}\t{res[1]:.6f}\t{res[2]:.6f}")
+    main()

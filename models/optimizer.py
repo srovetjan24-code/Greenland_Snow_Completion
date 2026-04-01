@@ -1,20 +1,18 @@
 import numpy as np
 from utils.math_ops import swish_derivative
 
-
 # models/optimizer.py
 
 class BNLFT_Optimizer:
-    def __init__(self, lr=0.01, use_ar=True, use_graph=True, use_period=True):
+    def __init__(self, lr=0.01, use_ar=True, use_graph=True):
         """
-        优化器已更新：支持负数数据输入，并增加了 NaN 缺失值防御机制
+        针对格陵兰岛数据优化的优化器：
+        1. 支持负数数据输入
+        2. 自动跳过 NaN 缺失值
         """
         self.lr = lr
-
-        # 实验开关
         self.use_ar = use_ar
         self.use_graph = use_graph
-        self.use_period = use_period
 
         # 核心物理参数
         self.alpha_base = 0.7
@@ -25,10 +23,8 @@ class BNLFT_Optimizer:
     def step(self, model, r, j, k, val, n_d, missing_rate=0.0):
         """
         单步更新逻辑
-        val: 观测值，现在支持负数和 np.nan
         """
-
-        # 1. NaN 缺失值处理：如果当前点位无观测数据，直接跳过更新，防止梯度污染
+        # 1. NaN 缺失值防御：如果观测值为 NaN，直接跳过更新
         if np.isnan(val):
             return
 
@@ -36,7 +32,7 @@ class BNLFT_Optimizer:
         pred = model.predict(r, j, k)
         error = val - pred
 
-        # 3. 动态权重自适应 (针对格陵兰岛长周期特性)
+        # 3. 动态权重自适应
         if self.use_ar:
             alpha = self.alpha_base * (1.0 - missing_rate)
             beta = self.beta_base * (1.0 + missing_rate)
@@ -57,26 +53,21 @@ class BNLFT_Optimizer:
             else:
                 ar_grad = 0
 
-            # 正则化项：Swish 导数在负数区段具有非线性特性
+            # 正则化项 (Swish 导数)
             reg_t = self.lam * swish_derivative(model.T[k, res_idx])
 
-            # 时间梯度更新 (允许结果为负)
+            # 梯度更新 (移除 max(0, ...) 约束，允许负值)
             model.T[k, res_idx] += self.lr * (error * model.S[r, res_idx] * model.D[j, res_idx] - ar_grad - reg_t)
 
             # --- 空间因子 S 的更新 ---
             if self.use_graph:
-                # 空间二阶约束 (Graph Laplacian)
+                # 空间二阶约束 (使用 model.I 进行边界保护)
                 graph_grad = self.gamma * (2 * model.S[r, res_idx] -
                                            model.S[max(0, r - 1), res_idx] -
                                            model.S[min(model.I - 1, r + 1), res_idx])
             else:
                 graph_grad = 0
 
-            # 空间梯度更新 (允许结果为负)
+            # 梯度更新 (移除 max(0, ...) 约束)
             model.S[r, res_idx] += self.lr * (
-                    error * model.T[k, res_idx] * model.D[j, res_idx] - graph_grad - self.lam * model.S[r, res_idx])
-
-            # 5. 移除强制非负投影
-            # 为了适配格陵兰岛含负数的数据，此处不再执行 max(0, x) 操作
-            # model.T[k, res_idx] = model.T[k, res_idx]
-            # model.S[r, res_idx] = model.S[r, res_idx]
+                        error * model.T[k, res_idx] * model.D[j, res_idx] - graph_grad - self.lam * model.S[r, res_idx])
