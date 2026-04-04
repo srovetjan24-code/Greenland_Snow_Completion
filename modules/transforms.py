@@ -25,14 +25,17 @@ class SpatiotemporalTransforms:
         return T_W - W  # 返回 L = D - W [cite: 366]
 
     @staticmethod
-    def fractional_difference(n, alpha=0.98, K=3):
-        """生成分数阶微分下三角 Toeplitz 矩阵 T2 [cite: 386, 471]"""
-        T2 = np.zeros((n, n))
-        # 根据 GL 分数阶导数计算系数 g_k [cite: 387, 390, 395]
-        g = [((-1) ** k * gamma(alpha + 1)) / (gamma(k + 1) * gamma(alpha - k + 1)) for k in range(n)]
+    def fractional_difference(n, alpha=0.98):
+        """使用递推公式生成分数阶微分下三角矩阵，避免 Gamma 函数溢出"""
+        g = np.zeros(n)
+        g[0] = 1.0
+        for k in range(1, n):
+            # 递推公式: g(k) = g(k-1) * (1 - (alpha + 1) / k)
+            g[k] = g[k - 1] * (1 - (alpha + 1) / k)
 
+        T2 = np.zeros((n, n))
         for i in range(n):
-            # 构造下三角 Toeplitz 结构 [cite: 471, 485]
+            # 构造下三角 Toeplitz 结构
             T2[i, :i + 1] = g[:i + 1][::-1]
         return T2
 
